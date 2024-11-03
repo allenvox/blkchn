@@ -1,0 +1,19 @@
+name: CMake build & run workflow
+on: push
+jobs:
+  check_codestyle:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check codestyle
+      run: git ls-files '*.c' '*.h' '*.cpp' '*.hpp' | xargs clang-format -i --verbose && git diff --exit-code
+  preset_release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure CMake
+      run: cmake --preset release
+    - name: Build
+      run: cmake --build --preset release
+    - name: Run
+      run: build/bin/blkchn
