@@ -17,8 +17,9 @@ public:
     Block newBlock(chain.size(), data, chain.back().hash);
     chain.push_back(newBlock);
     node.setBalance(node.getBalance() + BLOCKADD_REWARD);
-    std::cout << "new block " << newBlock.hash.substr(0, 16) + "..." << "\tby\t"
-              << node.getId() << "\t(reward " << BLOCKADD_REWARD << " coins)\n";
+    std::cout << "new block " << newBlock.hash.substr(0, 16) + "..."
+              << "\tby\t" << node.getId() << "\t(reward " << BLOCKADD_REWARD
+              << " coins)\n";
   }
 
   bool isChainValid() {
