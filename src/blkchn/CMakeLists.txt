@@ -9,6 +9,12 @@ target_sources(
     main.cpp
 )
 
+target_include_directories(
+    ${target_name}
+    PUBLIC
+    ${PROJECT_SOURCE_DIR/blkchn}
+)
+
 target_link_libraries(
     ${target_name}
     OpenSSL::SSL
