@@ -3,6 +3,7 @@
 
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -135,111 +136,239 @@ public:
         }
         return 0.0;
     }
+
+    std::unordered_map<std::string, double> getBalances() const {
+        return balances;
+    }
 };
 
-// Сервер для обработки запросов
-class AdminServer {
+// ================== Authentication System ==================
+class UserManager {
 private:
-    boost::asio::io_context ioContext;
-    tcp::acceptor acceptor;
-    Blockchain blockchain;
+    struct User {
+        std::string password_hash;
+        bool is_admin;
+    };
 
-    void startAccept() {
-        auto socket = std::make_shared<tcp::socket>(ioContext);
-        acceptor.async_accept(*socket, [this, socket](boost::system::error_code ec) {
-            if (!ec) {
-                handleClient(socket);
-            }
-            startAccept();
-        });
+    std::unordered_map<std::string, User> users;
+    std::mutex users_mutex;
+
+    std::string hashPassword(const std::string& password) {
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(password.c_str()), 
+              password.length(), digest);
+        
+        std::stringstream ss;
+        for(int i=0; i<SHA256_DIGEST_LENGTH; i++)
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(digest[i]);
+        return ss.str();
     }
 
-    void handleClient(std::shared_ptr<tcp::socket> socket) {
-        auto buffer = std::make_shared<boost::asio::streambuf>();
-        boost::asio::async_read_until(*socket, *buffer, '\n',
-            [this, socket, buffer](boost::system::error_code ec, std::size_t length) {
+public:
+    UserManager() {
+        // Add admin user (username, password, is_admin)
+        addUser("admin", "1234", true);
+    }
+
+    bool addUser(const std::string& username, const std::string& password, bool is_admin=false) {
+        std::lock_guard<std::mutex> lock(users_mutex);
+        if(users.count(username)) return false;
+        
+        users[username] = {
+            hashPassword(password),
+            is_admin
+        };
+        return true;
+    }
+
+    std::pair<bool, bool> authenticate(const std::string& username, const std::string& password) {
+        std::lock_guard<std::mutex> lock(users_mutex);
+        auto it = users.find(username);
+        if(it == users.end()) return {false, false};
+        
+        if(it->second.password_hash == hashPassword(password))
+            return {true, it->second.is_admin};
+        return {false, false};
+    }
+};
+
+// ================== Modified Session Class ==================
+class Session : public std::enable_shared_from_this<Session> {
+public:
+    Session(tcp::socket socket, Blockchain& blockchain, UserManager& auth)
+        : socket_(std::move(socket)), 
+          blockchain_(blockchain),
+          auth_(auth),
+          authenticated_(false),
+          is_admin_(false) {}
+
+    void start() {
+        sendPrompt("Please login with: LOGIN <username> <password>\n");
+        readCommand();
+    }
+
+private:
+    tcp::socket socket_;
+    Blockchain& blockchain_;
+    UserManager& auth_;
+    bool authenticated_;
+    bool is_admin_;
+    boost::asio::streambuf buffer_;
+
+    void readCommand() {
+        auto self(shared_from_this());
+        boost::asio::async_read_until(socket_, buffer_, '\n',
+            [this, self](boost::system::error_code ec, std::size_t length) {
                 if (!ec) {
-                    std::istream stream(buffer.get());
-                    std::string request;
-                    std::getline(stream, request); // Read until newline
-                    
-                    std::string response = processRequest(request);
-                    
-                    boost::asio::async_write(*socket, boost::asio::buffer(response),
-                        [this, socket](boost::system::error_code ec, std::size_t) {
-                            if (!ec) handleClient(socket); // Continue listening
-                        });
+                    std::istream is(&buffer_);
+                    std::string command;
+                    std::getline(is, command);
+                    processCommand(command);
+                    readCommand();
                 }
             });
     }
 
-    std::string processRequest(const std::string& request) {
-        std::istringstream iss(request);
-        std::string command;
-        iss >> command;
+    void processCommand(const std::string& command) {
+        std::istringstream iss(command);
+        std::string cmd;
+        iss >> cmd;
 
-        if (command == "MINE_BLOCK") {
-            blockchain.mineBlock();
-            return "Block mined with " 
-                 + std::to_string(blockchain.getChain().back().transactions.size()) 
-                 + " transactions\n";
+        std::string response;
+
+        if (!authenticated_) {
+            if (cmd == "LOGIN") {
+                std::string username, password;
+                if (iss >> username >> password) {
+                    auto [success, is_admin] = auth_.authenticate(username, password);
+                    if(success) {
+                        authenticated_ = true;
+                        is_admin_ = is_admin;
+                        response = "Authentication successful. Role: " + 
+                                  std::string(is_admin ? "admin" : "user") + "\n";
+                    } else {
+                        response = "Invalid credentials\n";
+                    }
+                } else {
+                    response = "Usage: LOGIN <username> <password>\n";
+                }
+            } else {
+                response = "You must login first\n";
+            }
+        } else {
+            if (cmd == "ISSUE_COINS" && is_admin_) {
+                std::string address;
+                double amount;
+                if (!(iss >> address >> amount)) {
+                    response = "ERROR: Invalid format. Use: ISSUE_COINS <address> <amount>\n";
+                }
+                blockchain_.issueCoins(address, amount);
+                response = "Coins issued successfully.\n";
+            }
+            else if (cmd == "ADD_TRANSACTION") {
+                Transaction tx;
+                if (!(iss >> tx.senderAddress >> tx.receiverAddress >> tx.amount >> tx.signature)) {
+                    response = "ERROR: Invalid transaction format\n";
+                }
+                try {
+                    blockchain_.addTransaction(tx);
+                    response = "Transaction added to pending pool\n";
+                } catch (const std::exception& e) {
+                    response = "Error: " + std::string(e.what()) + "\n";
+                }
+            }
+            else if (cmd == "MINE_BLOCK") {
+                blockchain_.mineBlock();
+                response = "Block mined with " 
+                    + std::to_string(blockchain_.getChain().back().transactions.size()) 
+                    + " transactions\n";
+            }
+            else if (command == "GET_CHAIN") {
+                for (const auto& block : blockchain_.getChain()) {
+                    response += "Block #" + std::to_string(block.index) 
+                             + " Hash: " + block.hash + "\n";
+                }
+            } 
+            else if (command == "GET_BALANCE") {
+                std::string address;
+                if (!(iss >> address)) {
+                    response = "ERROR: Invalid format. Use: GET_BALANCE <address>\n";
+                }
+                double balance = blockchain_.getBalance(address);
+                response = "Balance: " + std::to_string(balance) + "\n";
+            }
+            else if (cmd == "ADD_USER" && is_admin_) {
+                std::string username, password;
+                if (iss >> username >> password) {
+                    if(auth_.addUser(username, password)) {
+                        response = "User added successfully\n";
+                    } else {
+                        response = "Username already exists\n";
+                    }
+                }
+            }
+            else if (cmd == "VIEW_ALL_BALANCES" && is_admin_) {
+                response = "All balances:\n";
+                for (const auto& [address, balance] : blockchain_.getBalances()) {
+                    response += address + ": " + std::to_string(balance) + "\n";
+                }
+            }
+            else {
+                response = "Unknown command\n";
+            }
         }
-        else if (command == "ADD_TRANSACTION") {
-            Transaction tx;
-            if (!(iss >> tx.senderAddress >> tx.receiverAddress >> tx.amount >> tx.signature)) {
-                return "ERROR: Invalid transaction format\n";
-            }
-            try {
-                blockchain.addTransaction(tx);
-                return "Transaction added to pending pool\n";
-            } catch (const std::exception& e) {
-                return "Error: " + std::string(e.what()) + "\n";
-            }
-        }
-        else if (command == "GET_CHAIN") {
-            std::string response;
-            for (const auto& block : blockchain.getChain()) {
-                response += "Block #" + std::to_string(block.index) 
-                          + " Hash: " + block.hash + "\n";
-            }
-            return response;
-        } 
-        else if (command == "ISSUE_COINS") {
-            std::string address;
-            double amount;
-            if (!(iss >> address >> amount)) {
-                return "ERROR: Invalid format. Use: ISSUE_COINS <address> <amount>\n";
-            }
-            blockchain.issueCoins(address, amount);
-            return "Coins issued successfully.\n";
-        } 
-        else if (command == "GET_BALANCE") {
-            std::string address;
-            if (!(iss >> address)) {
-                return "ERROR: Invalid format. Use: GET_BALANCE <address>\n";
-            }
-            double balance = blockchain.getBalance(address);
-            return "Balance: " + std::to_string(balance) + "\n";
-        }
-        return "Unknown command.\n";
+
+        sendResponse(response);
+    }
+
+    void sendResponse(const std::string& response) {
+        auto self(shared_from_this());
+        boost::asio::async_write(socket_, boost::asio::buffer(response + "> "),
+            [](boost::system::error_code, std::size_t) {});
+    }
+
+    void sendPrompt(const std::string& prompt) {
+        auto self(shared_from_this());
+        boost::asio::async_write(socket_, boost::asio::buffer(prompt),
+            [](boost::system::error_code, std::size_t) {});
+    }
+};
+
+// ================== Modified AdminServer ==================
+class AdminServer {
+private:
+    boost::asio::io_context& io_context_;
+    tcp::acceptor acceptor_;
+    Blockchain blockchain_;
+    UserManager auth_manager_;
+
+    void startAccept() {
+        acceptor_.async_accept(
+            [this](boost::system::error_code ec, tcp::socket socket) {
+                if (!ec) {
+                    std::make_shared<Session>(std::move(socket), 
+                                            blockchain_, 
+                                            auth_manager_)->start();
+                }
+                startAccept();
+            });
     }
 
 public:
-    AdminServer(short port) 
-        : acceptor(ioContext, tcp::endpoint(tcp::v4(), port)) {}
-
-    void run() {
+    AdminServer(boost::asio::io_context& io_context, short port)
+        : io_context_(io_context),
+          acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
         startAccept();
-        ioContext.run();
     }
 };
 
 int main() {
     short port = 12345;
     try {
-        AdminServer server(port);
+        boost::asio::io_context io_context;
+        AdminServer server(io_context, port);
         std::cout << "Admin server is running on port " << port << std::endl;
-        server.run();
+        io_context.run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
