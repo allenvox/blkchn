@@ -1,22 +1,14 @@
-cmake_minimum_required(VERSION 3.22)
-
+cmake_minimum_required(VERSION 3.12)
 project(blkchn)
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
-include(CompileOptions)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
 
-find_program(CLANG_TIDY_EXE NAMES clang-tidy-14 clang-tidy)
-if(NOT CLANG_TIDY_EXE)
-    message(WARNING "clang-tidy not found")
-else()
-    execute_process(
-        COMMAND ${CLANG_TIDY_EXE} --version
-        OUTPUT_VARIABLE CLANG_TIDY_VERSION
-    )
-    message("clang-tidy found:\n" ${CLANG_TIDY_VERSION})
-endif()
+add_executable(server server.cpp)
+target_link_libraries(server Boost::system Boost::thread OpenSSL::Crypto)
 
-add_subdirectory(src)
+add_executable(client client.cpp)
+target_link_libraries(client Boost::system Boost::thread)
